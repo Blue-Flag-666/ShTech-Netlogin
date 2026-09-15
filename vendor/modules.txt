@@ -11,8 +11,8 @@ github.com/Kazuhito00/onnx-purego-interpreter/internal/optimize
 github.com/Kazuhito00/onnx-purego-interpreter/internal/reader
 github.com/Kazuhito00/onnx-purego-interpreter/onnx
 github.com/Kazuhito00/onnx-purego-interpreter/tensor
-# golang.org/x/image v0.31.0
-## explicit; go 1.24.0
+# golang.org/x/image v0.41.0
+## explicit; go 1.25.0
 golang.org/x/image/draw
 golang.org/x/image/math/f64
 # google.golang.org/protobuf v1.36.11
