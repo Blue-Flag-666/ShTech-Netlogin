@@ -82,7 +82,7 @@ shtu-net-login version        输出版本
 
 ## 构建与测试
 
-需要 Go 1.26.1 或更新版本：
+需要 Go 1.27.1 或更新版本：
 
 ```sh
 go test ./...
