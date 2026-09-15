@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/example/shtu-net-login/internal/config"
+	"github.com/Blue-Flag-666/ShTech-Netlogin/internal/config"
 )
 
 const maxResponseBytes = 1 << 20

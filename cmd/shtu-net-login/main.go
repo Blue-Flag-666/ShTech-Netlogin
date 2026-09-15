@@ -12,9 +12,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/example/shtu-net-login/internal/auth"
-	"github.com/example/shtu-net-login/internal/captcha"
-	"github.com/example/shtu-net-login/internal/config"
+	"github.com/Blue-Flag-666/ShTech-Netlogin/internal/auth"
+	"github.com/Blue-Flag-666/ShTech-Netlogin/internal/captcha"
+	"github.com/Blue-Flag-666/ShTech-Netlogin/internal/config"
 )
 
 var version = "dev"

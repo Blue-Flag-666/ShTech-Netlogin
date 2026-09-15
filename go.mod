@@ -1,4 +1,4 @@
-module github.com/example/shtu-net-login
+module github.com/Blue-Flag-666/ShTech-Netlogin
 
 go 1.26.1
 
