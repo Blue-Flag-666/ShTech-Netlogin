@@ -9,109 +9,121 @@ import (
 
 // LSTM op — Long Short-Term Memory (recurrent).
 // Inputs: X[seq_len, batch, input_size], W[num_dir, 4*hidden, input], R[num_dir, 4*hidden, hidden],
-//
-//	B[num_dir, 8*hidden] (optional), sequence_lens (optional),
-//	initial_h[num_dir, batch, hidden] (optional), initial_c[num_dir, batch, hidden] (optional)
-//
+//         B[num_dir, 8*hidden] (optional), sequence_lens (optional),
+//         initial_h[num_dir, batch, hidden] (optional), initial_c[num_dir, batch, hidden] (optional)
 // Outputs: Y[seq_len, num_dir, batch, hidden], Y_h[num_dir, batch, hidden], Y_c[num_dir, batch, hidden]
 func opLSTM(node *ir.Node, inputs []tensor.Tensor) ([]tensor.Tensor, error) {
 	direction := node.GetAttrString("direction", "forward")
 	hiddenSize := int(node.GetAttrInt("hidden_size", 0))
+	_ = direction // only forward supported for now
+
 	x := inputs[0].(*tensor.Dense[float32])
 	w := inputs[1].(*tensor.Dense[float32])
 	r := inputs[2].(*tensor.Dense[float32])
-	xShape := x.Shape()
+
+	xShape := x.Shape() // [seq_len, batch, input_size]
 	seqLen := xShape[0]
 	batch := xShape[1]
 	inputSize := xShape[2]
-	if hiddenSize == 0 {
-		hiddenSize = r.Shape()[2]
-	}
-	H := hiddenSize
-	gate4H := 4 * H
-	numDir := w.Shape()[0]
 
+	if hiddenSize == 0 {
+		hiddenSize = r.Shape()[2] // R is [num_dir, 4*hidden, hidden]
+	}
+
+	// Bias (optional)
 	var biasData []float32
 	if len(inputs) > 3 && inputs[3] != nil {
 		biasData = inputs[3].(*tensor.Dense[float32]).Data()
 	}
+
+	// Initial hidden state (optional)
 	var hData []float32
 	if len(inputs) > 5 && inputs[5] != nil {
 		h := inputs[5].(*tensor.Dense[float32])
 		hData = make([]float32, h.Len())
 		copy(hData, h.Data())
 	} else {
-		hData = make([]float32, numDir*batch*H)
+		hData = make([]float32, batch*hiddenSize)
 	}
+
+	// Initial cell state (optional)
 	var cData []float32
 	if len(inputs) > 6 && inputs[6] != nil {
 		c := inputs[6].(*tensor.Dense[float32])
 		cData = make([]float32, c.Len())
 		copy(cData, c.Data())
 	} else {
-		cData = make([]float32, numDir*batch*H)
+		cData = make([]float32, batch*hiddenSize)
 	}
-	wData := w.Data()
-	rData := r.Data()
-	xData := x.Data()
-	wDirStride := gate4H * inputSize
-	rDirStride := gate4H * H
-	bDirStride := 2 * gate4H
-	yData := make([]float32, seqLen*numDir*batch*H)
 
-	for dir := 0; dir < numDir; dir++ {
-		wBase := dir * wDirStride
-		rBase := dir * rDirStride
-		bBase := dir * bDirStride
-		stateBase := dir * batch * H
-		backward := direction == "reverse" || (direction == "bidirectional" && dir == 1)
-		for step := 0; step < seqLen; step++ {
-			t := step
-			if backward {
-				t = seqLen - 1 - step
+	wData := w.Data() // [1, 4*hidden, input_size]
+	rData := r.Data() // [1, 4*hidden, hidden]
+	xData := x.Data()
+
+	H := hiddenSize
+	gate4H := 4 * H
+
+	// Output: Y[seq_len, 1, batch, hidden]
+	yData := make([]float32, seqLen*batch*H)
+
+	for t := 0; t < seqLen; t++ {
+		for b := 0; b < batch; b++ {
+			xOff := t*batch*inputSize + b*inputSize
+			hOff := b * H
+
+			// Compute gates: i, o, f, c = W*x + R*h + bias
+			gates := make([]float32, gate4H)
+
+			// W * x_t: gates[g] += sum_j W[g,j] * x[t,b,j]
+			for g := 0; g < gate4H; g++ {
+				var sum float32
+				wOff := g * inputSize // W is [1, 4H, input_size], skip dir=0
+				for j := 0; j < inputSize; j++ {
+					sum += wData[wOff+j] * xData[xOff+j]
+				}
+				gates[g] = sum
 			}
-			for b := 0; b < batch; b++ {
-				xOff := t*batch*inputSize + b*inputSize
-				hOff := stateBase + b*H
-				gates := make([]float32, gate4H)
-				for g := 0; g < gate4H; g++ {
-					var sum float32
-					wOff := wBase + g*inputSize
-					for j := 0; j < inputSize; j++ {
-						sum += wData[wOff+j] * xData[xOff+j]
-					}
-					gates[g] = sum
+
+			// R * h_{t-1}: gates[g] += sum_j R[g,j] * h[b,j]
+			for g := 0; g < gate4H; g++ {
+				var sum float32
+				rOff := g * H
+				for j := 0; j < H; j++ {
+					sum += rData[rOff+j] * hData[hOff+j]
 				}
-				for g := 0; g < gate4H; g++ {
-					var sum float32
-					rOff := rBase + g*H
-					for j := 0; j < H; j++ {
-						sum += rData[rOff+j] * hData[hOff+j]
-					}
-					gates[g] += sum
-				}
-				if biasData != nil {
-					for g := 0; g < gate4H; g++ {
-						gates[g] += biasData[bBase+g] + biasData[bBase+gate4H+g]
-					}
-				}
-				for h := 0; h < H; h++ {
-					it := sigmoid32(gates[h])
-					ot := sigmoid32(gates[H+h])
-					ft := sigmoid32(gates[2*H+h])
-					ct := float32(math.Tanh(float64(gates[3*H+h])))
-					cellIdx := hOff + h
-					cData[cellIdx] = ft*cData[cellIdx] + it*ct
-					hData[cellIdx] = ot * float32(math.Tanh(float64(cData[cellIdx])))
-				}
-				yOff := t*numDir*batch*H + dir*batch*H + b*H
-				copy(yData[yOff:yOff+H], hData[hOff:hOff+H])
+				gates[g] += sum
 			}
+
+			// Add bias (Wb + Rb): bias is [1, 8*H] = [Wb_i,Wb_o,Wb_f,Wb_c, Rb_i,Rb_o,Rb_f,Rb_c]
+			if biasData != nil {
+				for g := 0; g < gate4H; g++ {
+					gates[g] += biasData[g] + biasData[gate4H+g]
+				}
+			}
+
+			// ONNX LSTM gate order: i, o, f, c (iofc)
+			for h := 0; h < H; h++ {
+				it := sigmoid32(gates[0*H+h])     // input gate
+				ot := sigmoid32(gates[1*H+h])     // output gate
+				ft := sigmoid32(gates[2*H+h])     // forget gate
+				ct := float32(math.Tanh(float64(gates[3*H+h]))) // cell candidate
+
+				cellIdx := hOff + h
+				cData[cellIdx] = ft*cData[cellIdx] + it*ct
+				hData[hOff+h] = ot * float32(math.Tanh(float64(cData[cellIdx])))
+			}
+
+			// Store output
+			yOff := t*batch*H + b*H
+			copy(yData[yOff:yOff+H], hData[hOff:hOff+H])
 		}
 	}
-	Y := tensor.NewDense[float32](tensor.Shape{seqLen, numDir, batch, H}, yData)
-	Yh := tensor.NewDense[float32](tensor.Shape{numDir, batch, H}, hData)
-	Yc := tensor.NewDense[float32](tensor.Shape{numDir, batch, H}, cData)
+
+	// Build output tensors
+	Y := tensor.NewDense[float32](tensor.Shape{seqLen, 1, batch, H}, yData)
+	Yh := tensor.NewDense[float32](tensor.Shape{1, batch, H}, hData)
+	Yc := tensor.NewDense[float32](tensor.Shape{1, batch, H}, cData)
+
 	return []tensor.Tensor{Y, Yh, Yc}, nil
 }
 
@@ -121,10 +133,8 @@ func sigmoid32(x float32) float32 {
 
 // GRU op — Gated Recurrent Unit.
 // Inputs: X[seq_len, batch, input_size], W[num_dir, 3*hidden, input], R[num_dir, 3*hidden, hidden],
-//
-//	B[num_dir, 6*hidden] (optional), sequence_lens (optional),
-//	initial_h[num_dir, batch, hidden] (optional)
-//
+//         B[num_dir, 6*hidden] (optional), sequence_lens (optional),
+//         initial_h[num_dir, batch, hidden] (optional)
 // Outputs: Y[seq_len, num_dir, batch, hidden], Y_h[num_dir, batch, hidden]
 func opGRU(node *ir.Node, inputs []tensor.Tensor) ([]tensor.Tensor, error) {
 	hiddenSize := int(node.GetAttrInt("hidden_size", 0))
@@ -165,9 +175,9 @@ func opGRU(node *ir.Node, inputs []tensor.Tensor) ([]tensor.Tensor, error) {
 	rData := r.Data()
 	xData := x.Data()
 
-	wDirStride := gate3H * inputSize // stride per direction in W
-	rDirStride := gate3H * H         // stride per direction in R
-	bDirStride := 2 * gate3H         // stride per direction in B
+	wDirStride := gate3H * inputSize  // stride per direction in W
+	rDirStride := gate3H * H          // stride per direction in R
+	bDirStride := 2 * gate3H          // stride per direction in B
 
 	yData := make([]float32, seqLen*numDir*batch*H)
 
