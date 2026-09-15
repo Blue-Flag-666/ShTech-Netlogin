@@ -1,0 +1,407 @@
+package ops
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+
+	"github.com/Kazuhito00/onnx-purego-interpreter/internal/ir"
+	"github.com/Kazuhito00/onnx-purego-interpreter/tensor"
+)
+
+var activePoolConfig *KernelConfig
+
+// ceilDiv は a/b の切り上げ除算(a,b は非負を想定)。
+func ceilDiv(a, b int) int {
+	if a <= 0 {
+		return 0
+	}
+	return (a + b - 1) / b
+}
+
+func makeMaxPool(kc *KernelConfig) OpFunc {
+	return func(node *ir.Node, inputs []tensor.Tensor) ([]tensor.Tensor, error) {
+		activePoolConfig = kc
+		return opMaxPool(node, inputs)
+	}
+}
+
+func opMaxPool(node *ir.Node, inputs []tensor.Tensor) ([]tensor.Tensor, error) {
+	switch x := inputs[0].(type) {
+	case *tensor.Dense[float32]:
+		out, err := maxPool2d(x, node)
+		if err != nil {
+			return nil, fmt.Errorf("MaxPool: %w", err)
+		}
+		return []tensor.Tensor{out}, nil
+	case *tensor.Dense[float64]:
+		out, err := maxPool2d(x, node)
+		if err != nil {
+			return nil, fmt.Errorf("MaxPool: %w", err)
+		}
+		return []tensor.Tensor{out}, nil
+	default:
+		return nil, fmt.Errorf("MaxPool: unsupported type %T", inputs[0])
+	}
+}
+
+func maxPool2d[T tensor.Numeric](x *tensor.Dense[T], node *ir.Node) (*tensor.Dense[T], error) {
+	xShape := x.Shape() // [N, C, H, W]
+	if xShape.NDim() != 4 {
+		return nil, fmt.Errorf("maxPool2d requires 4D input, got %v", xShape)
+	}
+
+	N, C, H, W := xShape[0], xShape[1], xShape[2], xShape[3]
+
+	kernelShape := node.GetAttrInts("kernel_shape", nil)
+	if kernelShape == nil || len(kernelShape) < 2 {
+		return nil, fmt.Errorf("MaxPool: kernel_shape required")
+	}
+	KH, KW := int(kernelShape[0]), int(kernelShape[1])
+
+	strides := node.GetAttrInts("strides", []int64{1, 1})
+	strideH, strideW := int(strides[0]), int(strides[1])
+
+	padTop, padLeft, padBottom, padRight := computePads(node, H, W, KH, KW, strideH, strideW)
+
+	floorOH := (H+padTop+padBottom-KH)/strideH + 1
+	floorOW := (W+padLeft+padRight-KW)/strideW + 1
+	OH, OW := floorOH, floorOW
+	if node.GetAttrInt("ceil_mode", 0) != 0 {
+		// ceil_mode=1: 最後のウィンドウが入力+pad領域の外へはみ出しても、開始位置さえ
+		// 範囲内なら出力に含める(ONNX Pool の ceil_mode 仕様)。はみ出した分は境界外
+		// アクセスとして下の各ループの範囲チェックにより自然に除外/pad 扱いされる。
+		OH = ceilDiv(H+padTop+padBottom-KH, strideH) + 1
+		OW = ceilDiv(W+padLeft+padRight-KW, strideW) + 1
+	}
+
+	outShape := tensor.Shape{N, C, OH, OW}
+	outData := make([]T, outShape.Size())
+	xData := x.Data()
+
+	// (n,c) 平面ごとに独立なため、大きな入力ではチャネル単位で並列化する
+	poolWorkers := 1
+	if OH*OW*KH*KW*N*C > 200_000 && N*C >= 2 {
+		poolWorkers = activePoolConfig.ParallelOpsWorkers()
+	}
+
+	// ceil_mode によって最終行/列が入力範囲外へはみ出す場合、境界チェックなしの
+	// 高速パスは範囲外読み出しを起こすため使わない(汎用パスへフォールバック)。
+	noOverhang := OH == floorOH && OW == floorOW
+
+	// Fast path: 2x2 stride 2, no padding
+	usePoolFP := noOverhang && (activePoolConfig == nil || activePoolConfig.UsePoolFastPath)
+	if usePoolFP && KH == 2 && KW == 2 && strideH == 2 && strideW == 2 && padTop == 0 && padLeft == 0 {
+		forEachIndexParallel(N*C, poolWorkers, func(nc int) {
+			xBase := nc * H * W
+			oBase := nc * OH * OW
+			for oh := 0; oh < OH; oh++ {
+				ih := oh * 2
+				for ow := 0; ow < OW; ow++ {
+					iw := ow * 2
+					r0 := xBase + ih*W + iw
+					r1 := r0 + W
+					_ = xData[r1+1] // BCE hint
+					v0 := xData[r0]
+					v1 := xData[r0+1]
+					v2 := xData[r1]
+					v3 := xData[r1+1]
+					m := v0
+					if v1 > m {
+						m = v1
+					}
+					if v2 > m {
+						m = v2
+					}
+					if v3 > m {
+						m = v3
+					}
+					outData[oBase+oh*OW+ow] = m
+				}
+			}
+		})
+		return tensor.NewDense[T](outShape, outData), nil
+	}
+
+	// Fast path: 2x2 stride 1, no padding.
+	if usePoolFP && KH == 2 && KW == 2 && strideH == 1 && strideW == 1 &&
+		padTop == 0 && padLeft == 0 && padBottom == 0 && padRight == 0 {
+		forEachIndexParallel(N*C, poolWorkers, func(nc int) {
+			xBase := nc * H * W
+			oBase := nc * OH * OW
+			for oh := 0; oh < OH; oh++ {
+				r0, r1 := xBase+oh*W, xBase+(oh+1)*W
+				for ow := 0; ow < OW; ow++ {
+					v0, v1 := xData[r0+ow], xData[r0+ow+1]
+					v2, v3 := xData[r1+ow], xData[r1+ow+1]
+					m := v0
+					if v1 > m {
+						m = v1
+					}
+					if v2 > m {
+						m = v2
+					}
+					if v3 > m {
+						m = v3
+					}
+					outData[oBase+oh*OW+ow] = m
+				}
+			}
+		})
+		return tensor.NewDense[T](outShape, outData), nil
+	}
+	// Fast path: 3x3 stride 2 (with or without padding)
+	if usePoolFP && KH == 3 && KW == 3 && strideH == 2 && strideW == 2 {
+		forEachIndexParallel(N*C, poolWorkers, func(nc int) {
+			xBase := nc * H * W
+			oBase := nc * OH * OW
+			for oh := 0; oh < OH; oh++ {
+				ih0 := oh*2 - padTop
+				for ow := 0; ow < OW; ow++ {
+					iw0 := ow*2 - padLeft
+					first := true
+					var maxVal T
+					for kh := 0; kh < 3; kh++ {
+						ih := ih0 + kh
+						if ih < 0 || ih >= H {
+							continue
+						}
+						row := xBase + ih*W
+						for kw := 0; kw < 3; kw++ {
+							iw := iw0 + kw
+							if iw < 0 || iw >= W {
+								continue
+							}
+							v := xData[row+iw]
+							if first || v > maxVal {
+								first = false
+								maxVal = v
+							}
+						}
+					}
+					outData[oBase+oh*OW+ow] = maxVal
+				}
+			}
+		})
+		return tensor.NewDense[T](outShape, outData), nil
+	}
+
+	// General path
+	forEachIndexParallel(N*C, poolWorkers, func(nc int) {
+		xBase := nc * H * W
+		oBase := nc * OH * OW
+		for oh := 0; oh < OH; oh++ {
+			for ow := 0; ow < OW; ow++ {
+				first := true
+				var maxVal T
+				for kh := 0; kh < KH; kh++ {
+					for kw := 0; kw < KW; kw++ {
+						ih := oh*strideH - padTop + kh
+						iw := ow*strideW - padLeft + kw
+						if ih >= 0 && ih < H && iw >= 0 && iw < W {
+							v := xData[xBase+ih*W+iw]
+							if first || v > maxVal {
+								first = false
+								maxVal = v
+							}
+						}
+					}
+				}
+				outData[oBase+oh*OW+ow] = maxVal
+			}
+		}
+	})
+
+	return tensor.NewDense[T](outShape, outData), nil
+}
+
+// elementwiseParallelMin は exp/erf 等の重い elementwise 演算を並列化する最小要素数。
+// これ未満では goroutine 起動コストが上回る。
+const elementwiseParallelMin = 64 * 1024
+
+// cheapParallelMin は Relu などの帯域律速な軽量 elementwise 用の閾値。
+// 計算が軽い演算は並列化の益が小さく、キャッシュ局所性も失うため大きめに取る。
+const cheapParallelMin = 2 * 1024 * 1024
+
+// forEachRangeParallel は [0, n) を連続チャンクに分割して fn(lo, hi) を並列実行する。
+// fn は互いに素な範囲のみに書き込むこと。
+func forEachRangeParallel(n, workers int, fn func(lo, hi int)) {
+	if workers <= 1 || n <= 0 {
+		fn(0, n)
+		return
+	}
+	nWorkers := min(workers, (n+1023)/1024)
+	chunk := (n + nWorkers - 1) / nWorkers
+	var wg sync.WaitGroup
+	for w := 0; w < nWorkers; w++ {
+		lo := w * chunk
+		if lo >= n {
+			break
+		}
+		hi := min(lo+chunk, n)
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			fn(lo, hi)
+		}(lo, hi)
+	}
+	wg.Wait()
+}
+
+// forEachIndexParallel は fn(0..count-1) を最大 workers 並列で実行する。
+// 動的分配のため P/E コア混在でも負荷が偏らない。fn は互いに独立であること。
+func forEachIndexParallel(count, workers int, fn func(idx int)) {
+	if workers <= 1 || count <= 1 {
+		for i := 0; i < count; i++ {
+			fn(i)
+		}
+		return
+	}
+	nWorkers := min(workers, count)
+	var next atomic.Int32
+	var wg sync.WaitGroup
+	for w := 0; w < nWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(next.Add(1)) - 1
+				if i >= count {
+					return
+				}
+				fn(i)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func opAveragePool(node *ir.Node, inputs []tensor.Tensor) ([]tensor.Tensor, error) {
+	switch x := inputs[0].(type) {
+	case *tensor.Dense[float32]:
+		out, err := avgPool2d(x, node)
+		if err != nil {
+			return nil, fmt.Errorf("AveragePool: %w", err)
+		}
+		return []tensor.Tensor{out}, nil
+	case *tensor.Dense[float64]:
+		out, err := avgPool2d(x, node)
+		if err != nil {
+			return nil, fmt.Errorf("AveragePool: %w", err)
+		}
+		return []tensor.Tensor{out}, nil
+	default:
+		return nil, fmt.Errorf("AveragePool: unsupported type %T", inputs[0])
+	}
+}
+
+func avgPool2d[T tensor.Numeric](x *tensor.Dense[T], node *ir.Node) (*tensor.Dense[T], error) {
+	xShape := x.Shape()
+	if xShape.NDim() != 4 {
+		return nil, fmt.Errorf("avgPool2d requires 4D input, got %v", xShape)
+	}
+
+	N, C, H, W := xShape[0], xShape[1], xShape[2], xShape[3]
+
+	kernelShape := node.GetAttrInts("kernel_shape", nil)
+	if kernelShape == nil || len(kernelShape) < 2 {
+		return nil, fmt.Errorf("AveragePool: kernel_shape required")
+	}
+	KH, KW := int(kernelShape[0]), int(kernelShape[1])
+
+	strides := node.GetAttrInts("strides", []int64{1, 1})
+	strideH, strideW := int(strides[0]), int(strides[1])
+
+	padTop, padLeft, padBottom, padRight := computePads(node, H, W, KH, KW, strideH, strideW)
+
+	countIncludePad := node.GetAttrInt("count_include_pad", 0) != 0
+
+	OH := (H+padTop+padBottom-KH)/strideH + 1
+	OW := (W+padLeft+padRight-KW)/strideW + 1
+	if node.GetAttrInt("ceil_mode", 0) != 0 {
+		OH = ceilDiv(H+padTop+padBottom-KH, strideH) + 1
+		OW = ceilDiv(W+padLeft+padRight-KW, strideW) + 1
+	}
+
+	outShape := tensor.Shape{N, C, OH, OW}
+	outData := make([]T, outShape.Size())
+	xData := x.Data()
+
+	for n := 0; n < N; n++ {
+		for c := 0; c < C; c++ {
+			xBase := n*C*H*W + c*H*W
+			oBase := n*C*OH*OW + c*OH*OW
+			for oh := 0; oh < OH; oh++ {
+				for ow := 0; ow < OW; ow++ {
+					var sum float64
+					count := 0
+					for kh := 0; kh < KH; kh++ {
+						for kw := 0; kw < KW; kw++ {
+							ih := oh*strideH - padTop + kh
+							iw := ow*strideW - padLeft + kw
+							if ih >= 0 && ih < H && iw >= 0 && iw < W {
+								sum += float64(xData[xBase+ih*W+iw])
+								count++
+							} else if countIncludePad && ih >= -padTop && ih < H+padBottom && iw >= -padLeft && iw < W+padRight {
+								// 明示的な pad 領域内のみカウント対象。ceil_mode によって
+								// 入力+宣言済み pad の外側へはみ出した分は
+								// count_include_pad の値に関わらず常に除外する
+								// (PyTorch/ONNX Runtime の ceil_mode 実装と同じ挙動)。
+								count++
+							}
+						}
+					}
+					if count > 0 {
+						outData[oBase+oh*OW+ow] = T(sum / float64(count))
+					}
+				}
+			}
+		}
+	}
+
+	return tensor.NewDense[T](outShape, outData), nil
+}
+
+func opGlobalAveragePool(node *ir.Node, inputs []tensor.Tensor) ([]tensor.Tensor, error) {
+	switch x := inputs[0].(type) {
+	case *tensor.Dense[float32]:
+		return []tensor.Tensor{globalAvgPool(x)}, nil
+	case *tensor.Dense[float64]:
+		return []tensor.Tensor{globalAvgPool(x)}, nil
+	default:
+		return nil, fmt.Errorf("GlobalAveragePool: unsupported type %T", inputs[0])
+	}
+}
+
+func globalAvgPool[T tensor.Numeric](x *tensor.Dense[T]) *tensor.Dense[T] {
+	xShape := x.Shape() // [N, C, H, W, ...]
+	N, C := xShape[0], xShape[1]
+	spatialSize := 1
+	for i := 2; i < xShape.NDim(); i++ {
+		spatialSize *= xShape[i]
+	}
+
+	outShape := make(tensor.Shape, xShape.NDim())
+	outShape[0] = N
+	outShape[1] = C
+	for i := 2; i < xShape.NDim(); i++ {
+		outShape[i] = 1
+	}
+
+	outData := make([]T, N*C)
+	xData := x.Data()
+
+	for n := 0; n < N; n++ {
+		for c := 0; c < C; c++ {
+			var sum float64
+			base := n*C*spatialSize + c*spatialSize
+			xSlice := xData[base : base+spatialSize : base+spatialSize] // BCE
+			for i := 0; i < spatialSize; i++ {
+				sum += float64(xSlice[i])
+			}
+			outData[n*C+c] = T(sum / float64(spatialSize))
+		}
+	}
+
+	return tensor.NewDense[T](outShape, outData)
+}

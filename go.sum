@@ -1,0 +1,8 @@
+github.com/Kazuhito00/onnx-purego-interpreter v0.0.0-20260828064855-9ea1ef4fd77c h1:pVcgdMxrhYK3OURQoIBOwn8oNgubjzeg6Y5ySOs4Fa8=
+github.com/Kazuhito00/onnx-purego-interpreter v0.0.0-20260828064855-9ea1ef4fd77c/go.mod h1:cOa5K80MWSuzZmj8zWw77iRzzoU7gn25GGzlbNDIGZY=
+github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
+github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
+golang.org/x/image v0.31.0 h1:mLChjE2MV6g1S7oqbXC0/UcKijjm5fnJLUYKIYrLESA=
+golang.org/x/image v0.31.0/go.mod h1:R9ec5Lcp96v9FTF+ajwaH3uGxPH4fKfHHAVbUILxghA=
+google.golang.org/protobuf v1.36.11 h1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=
+google.golang.org/protobuf v1.36.11/go.mod h1:HTf+CrKn2C3g5S8VImy6tdcUvCska2kB7j23XfzDpco=

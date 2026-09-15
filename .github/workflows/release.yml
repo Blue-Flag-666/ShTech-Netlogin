@@ -1,0 +1,146 @@
+name: Build and release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag, for example v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Run tests and vet
+        run: |
+          go test -mod=vendor ./...
+          go vet -mod=vendor ./...
+
+  build:
+    name: Build ${{ matrix.filename }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            goarm: ""
+            filename: shtu-net-login-windows-amd64.exe
+          - goos: windows
+            goarch: arm64
+            goarm: ""
+            filename: shtu-net-login-windows-arm64.exe
+          - goos: linux
+            goarch: amd64
+            goarm: ""
+            filename: shtu-net-login-linux-amd64
+          - goos: linux
+            goarch: arm64
+            goarm: ""
+            filename: shtu-net-login-linux-arm64
+          - goos: linux
+            goarch: arm
+            goarm: "7"
+            filename: shtu-net-login-linux-armv7
+          - goos: darwin
+            goarch: amd64
+            goarm: ""
+            filename: shtu-net-login-darwin-amd64
+          - goos: darwin
+            goarch: arm64
+            goarm: ""
+            filename: shtu-net-login-darwin-arm64
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Validate release tag
+        env:
+          MANUAL_TAG: ${{ inputs.tag }}
+        run: |
+          version="${MANUAL_TAG:-$GITHUB_REF_NAME}"
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $version" >&2
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Cross-compile
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          FILENAME: ${{ matrix.filename }}
+        run: |
+          mkdir -p dist
+          go build -mod=vendor -trimpath \
+            -ldflags "-s -w -X main.version=$VERSION" \
+            -o "dist/$FILENAME" ./cmd/shtu-net-login
+          (cd dist && sha256sum "$FILENAME" > "$FILENAME.sha256")
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.filename }}
+          path: |
+            dist/${{ matrix.filename }}
+            dist/${{ matrix.filename }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+      - name: Validate release tag
+        env:
+          MANUAL_TAG: ${{ inputs.tag }}
+        run: |
+          version="${MANUAL_TAG:-$GITHUB_REF_NAME}"
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $version" >&2
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - name: Create release or replace its assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" release/* --clobber
+          else
+            gh release create "$VERSION" release/* --verify-tag --generate-notes
+          fi
