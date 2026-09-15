@@ -1,54 +1,160 @@
-# shtu-net-login
+# ShTech-Netlogin
 
-上海科技大学校园网自动认证工具。根据浏览器 HAR 中的新门户流程实现，验证码在本机通过内嵌模型识别；无需浏览器、Python、ONNX Runtime 或其他动态库。
+上海科技大学校园网自动登录工具。验证码完全在本机识别，无需浏览器、Python、ONNX Runtime 或其他动态库。
 
 > 本项目是非官方工具。请只使用自己的校园网账号，并遵守学校网络使用规定。
 
-## 功能
+## 支持平台
 
-- Windows、Linux、macOS；amd64、arm64，额外支持 Linux armv7
-- 单个可执行文件，无运行时依赖
-- `login` 单次登录、`watch` 断线监测并自动重登、`status` 状态检测
-- 自动从门户重定向提取 `pushPageId`、SSID、客户端 IP 和 AC 地址
-- 内嵌纯 Go 验证码推理，不调用外部 OCR 服务
-- 密码错误或账号锁定时停止重试，避免扩大锁定风险
-- 兼容参考项目的 `EGATE_ID`、`EGATE_PASSWORD` 环境变量
+| 系统 | 架构 | Release 文件 |
+| --- | --- | --- |
+| Windows | x64 | `shtu-net-login-windows-amd64.exe` |
+| Windows | ARM64 | `shtu-net-login-windows-arm64.exe` |
+| Linux | x64 | `shtu-net-login-linux-amd64` |
+| Linux | ARM64 | `shtu-net-login-linux-arm64` |
+| Linux | ARMv7 | `shtu-net-login-linux-armv7` |
+| macOS | Intel | `shtu-net-login-darwin-amd64` |
+| macOS | Apple Silicon | `shtu-net-login-darwin-arm64` |
 
-## 快速使用
+从 [Releases](https://github.com/Blue-Flag-666/ShTech-Netlogin/releases/latest) 下载对应文件。每个二进制旁边都有 `.sha256` 校验文件。
 
-推荐通过环境变量提供凭据，密码不会出现在命令行参数或进程列表中。
+## Windows 使用
 
-PowerShell：
+以下命令在 PowerShell 中运行。它们会自动选择 x64 或 ARM64 版本，并安装到当前用户目录：
 
 ```powershell
-$env:SHTU_USERNAME = "你的学号"
-$env:SHTU_PASSWORD = "你的密码"
-.\shtu-net-login-windows-amd64.exe login
-.\shtu-net-login-windows-amd64.exe watch
+$installDir = Join-Path $env:LOCALAPPDATA "Programs\ShTech-Netlogin"
+New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+$asset = if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq [Runtime.InteropServices.Architecture]::Arm64) { "shtu-net-login-windows-arm64.exe" } else { "shtu-net-login-windows-amd64.exe" }
+$exe = Join-Path $installDir "shtu-net-login.exe"
+Invoke-WebRequest "https://github.com/Blue-Flag-666/ShTech-Netlogin/releases/latest/download/$asset" -OutFile $exe
+& $exe version
 ```
 
-Linux/macOS：
+创建配置文件并用记事本填写学号和密码：
+
+```powershell
+$configDir = Join-Path $env:APPDATA "shtu-net-login"
+$configPath = Join-Path $configDir "config.json"
+New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+[IO.File]::WriteAllText($configPath, ((& $exe sample-config) -join "`n"), [Text.UTF8Encoding]::new($false))
+notepad $configPath
+```
+
+保存后测试：
+
+```powershell
+& $exe status
+& $exe login
+& $exe watch
+```
+
+`watch` 会持续运行；按 `Ctrl+C` 停止。
+
+## Linux 使用
+
+下载安装；脚本会根据当前机器选择 x64、ARM64 或 ARMv7：
 
 ```sh
-export SHTU_USERNAME='你的学号'
-export SHTU_PASSWORD='你的密码'
-./shtu-net-login-linux-amd64 login
-./shtu-net-login-linux-amd64 watch
+case "$(uname -m)" in
+  x86_64) asset=shtu-net-login-linux-amd64 ;;
+  aarch64|arm64) asset=shtu-net-login-linux-arm64 ;;
+  armv7l|armv7*) asset=shtu-net-login-linux-armv7 ;;
+  *) echo "不支持的架构: $(uname -m)" >&2; exit 1 ;;
+esac
+install -d "$HOME/.local/bin"
+curl -fL "https://github.com/Blue-Flag-666/ShTech-Netlogin/releases/latest/download/$asset" -o "$HOME/.local/bin/shtu-net-login"
+chmod 755 "$HOME/.local/bin/shtu-net-login"
+"$HOME/.local/bin/shtu-net-login" version
 ```
 
-也可以把 `config.example.json` 复制到系统配置目录：
+创建配置文件并编辑：
+
+```sh
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/shtu-net-login"
+mkdir -p "$config_dir"
+"$HOME/.local/bin/shtu-net-login" sample-config > "$config_dir/config.json"
+chmod 600 "$config_dir/config.json"
+"${EDITOR:-vi}" "$config_dir/config.json"
+```
+
+保存后测试：
+
+```sh
+"$HOME/.local/bin/shtu-net-login" status
+"$HOME/.local/bin/shtu-net-login" login
+"$HOME/.local/bin/shtu-net-login" watch
+```
+
+## macOS 使用
+
+下载安装；脚本会根据当前 Mac 选择 Intel 或 Apple Silicon 版本：
+
+```sh
+case "$(uname -m)" in
+  x86_64) asset=shtu-net-login-darwin-amd64 ;;
+  arm64) asset=shtu-net-login-darwin-arm64 ;;
+  *) echo "不支持的架构: $(uname -m)" >&2; exit 1 ;;
+esac
+mkdir -p "$HOME/.local/bin"
+curl -fL "https://github.com/Blue-Flag-666/ShTech-Netlogin/releases/latest/download/$asset" -o "$HOME/.local/bin/shtu-net-login"
+chmod 755 "$HOME/.local/bin/shtu-net-login"
+"$HOME/.local/bin/shtu-net-login" version
+```
+
+创建配置文件并编辑：
+
+```sh
+config_dir="$HOME/Library/Application Support/shtu-net-login"
+mkdir -p "$config_dir"
+"$HOME/.local/bin/shtu-net-login" sample-config > "$config_dir/config.json"
+chmod 600 "$config_dir/config.json"
+"${EDITOR:-vi}" "$config_dir/config.json"
+```
+
+保存后测试：
+
+```sh
+"$HOME/.local/bin/shtu-net-login" status
+"$HOME/.local/bin/shtu-net-login" login
+"$HOME/.local/bin/shtu-net-login" watch
+```
+
+## 配置说明
+
+默认配置文件位置：
 
 - Windows：`%AppData%\shtu-net-login\config.json`
 - Linux：`$XDG_CONFIG_HOME/shtu-net-login/config.json`，未设置时为 `~/.config/shtu-net-login/config.json`
 - macOS：`~/Library/Application Support/shtu-net-login/config.json`
 
-Linux/macOS 上请将包含密码的配置文件权限设为仅本人可读：
+配置示例：
 
-```sh
-chmod 600 ~/.config/shtu-net-login/config.json
+```json
+{
+  "username": "你的学号",
+  "password": "你的密码",
+  "interval": "30s",
+  "timeout": "12s",
+  "max_captcha_attempts": 5,
+  "insecure": false
+}
 ```
 
-## 命令
+也可以使用环境变量。环境变量优先于配置文件：
+
+```text
+SHTU_USERNAME     学号
+SHTU_PASSWORD     密码
+SHTU_BASE_URL     门户地址，一般无需设置
+SHTU_INTERVAL     检查间隔，例如 30s
+SHTU_TIMEOUT      请求超时，例如 12s
+SHTU_INSECURE     是否跳过 TLS 校验，true 或 false
+```
+
+同时兼容 `EGATE_ID` 和 `EGATE_PASSWORD`。不要把密码直接放入命令行参数或多人可读的启动脚本。
+
+## 命令与选项
 
 ```text
 shtu-net-login login          检测网络，需要认证时登录（默认命令）
@@ -58,62 +164,168 @@ shtu-net-login sample-config  输出示例配置
 shtu-net-login version        输出版本
 ```
 
-通用选项需放在命令之后：
+选项必须放在命令之后：
 
 ```text
 --config PATH       指定配置文件
 --interval 30s      watch 检查间隔
 --timeout 12s       HTTP 请求超时
---base-url URL      覆盖门户地址，主要用于测试
+--base-url URL      覆盖门户地址
 --insecure          跳过 TLS 证书校验，仅在证书异常时临时使用
 ```
 
-环境变量优先于配置文件：`SHTU_USERNAME`、`SHTU_PASSWORD`、`SHTU_BASE_URL`、`SHTU_INTERVAL`、`SHTU_TIMEOUT`、`SHTU_INSECURE`。也兼容 `EGATE_ID` 和 `EGATE_PASSWORD`。
+例如：
+
+```sh
+shtu-net-login watch --interval 1m --timeout 15s
+shtu-net-login login --config /path/to/config.json
+```
 
 ## 开机自动运行
 
-先确认 `watch` 在终端中工作，再按系统建立启动项：
+先在终端中确认 `watch` 可以成功登录，再配置开机启动。启动项中不保存密码，它会读取前面创建的配置文件。
 
-- Windows：使用“任务计划程序”，触发器选“用户登录时”，操作指向对应 exe，参数填 `watch`；凭据建议设置为该用户的环境变量或保存到配置文件。
-- Linux：建立用户级 systemd 服务，`ExecStart` 指向二进制并附加 `watch`，然后执行 `systemctl --user enable --now ...`。
-- macOS：建立用户 LaunchAgent，`ProgramArguments` 中写入二进制路径和 `watch`。
+### Windows 任务计划
 
-不要在多人可读的服务定义中直接写密码。
+在 PowerShell 中运行：
 
-## 构建与测试
+```powershell
+$exe = Join-Path $env:LOCALAPPDATA "Programs\ShTech-Netlogin\shtu-net-login.exe"
+$action = New-ScheduledTaskAction -Execute $exe -Argument "watch"
+$trigger = New-ScheduledTaskTrigger -AtLogOn
+$principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited
+Register-ScheduledTask -TaskName "ShTech-Netlogin" -Action $action -Trigger $trigger -Principal $principal -Description "上海科技大学校园网自动登录" -Force
+Start-ScheduledTask -TaskName "ShTech-Netlogin"
+Get-ScheduledTask -TaskName "ShTech-Netlogin"
+```
+
+停止并删除启动项：
+
+```powershell
+Stop-ScheduledTask -TaskName "ShTech-Netlogin" -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName "ShTech-Netlogin" -Confirm:$false
+```
+
+### Linux systemd 用户服务
+
+创建并启动服务：
+
+```sh
+mkdir -p "$HOME/.config/systemd/user"
+cat > "$HOME/.config/systemd/user/shtech-netlogin.service" <<'EOF'
+[Unit]
+Description=ShanghaiTech campus network auto login
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/shtu-net-login watch
+
+[Install]
+WantedBy=default.target
+EOF
+systemctl --user daemon-reload
+systemctl --user enable --now shtech-netlogin.service
+systemctl --user status shtech-netlogin.service
+```
+
+如需在尚未登录桌面时也启动用户服务，再执行：
+
+```sh
+sudo loginctl enable-linger "$USER"
+```
+
+查看日志：
+
+```sh
+journalctl --user -u shtech-netlogin.service -f
+```
+
+停止并删除服务：
+
+```sh
+systemctl --user disable --now shtech-netlogin.service
+rm "$HOME/.config/systemd/user/shtech-netlogin.service"
+systemctl --user daemon-reload
+```
+
+### macOS LaunchAgent
+
+创建并启动 LaunchAgent：
+
+```sh
+mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+cat > "$HOME/Library/LaunchAgents/io.github.blue-flag-666.shtech-netlogin.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.github.blue-flag-666.shtech-netlogin</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$HOME/.local/bin/shtu-net-login</string>
+    <string>watch</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$HOME/Library/Logs/ShTech-Netlogin.log</string>
+  <key>StandardErrorPath</key>
+  <string>$HOME/Library/Logs/ShTech-Netlogin.log</string>
+</dict>
+</plist>
+EOF
+plutil -lint "$HOME/Library/LaunchAgents/io.github.blue-flag-666.shtech-netlogin.plist"
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/io.github.blue-flag-666.shtech-netlogin.plist"
+launchctl kickstart -k "gui/$(id -u)/io.github.blue-flag-666.shtech-netlogin"
+```
+
+查看日志：
+
+```sh
+tail -f "$HOME/Library/Logs/ShTech-Netlogin.log"
+```
+
+停止并删除启动项：
+
+```sh
+launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/io.github.blue-flag-666.shtech-netlogin.plist"
+rm "$HOME/Library/LaunchAgents/io.github.blue-flag-666.shtech-netlogin.plist"
+```
+
+## 常见问题
+
+检查当前网络状态：
+
+```sh
+shtu-net-login status
+```
+
+- `online`：网络已连通，无需登录。
+- `captive`：检测到校园网认证门户，可以执行 `login`。
+- `offline`：没有可用网络，或未连接到校园网。
+
+自动启动不工作时，先停止系统启动项，再在终端前台运行 `shtu-net-login watch` 查看具体错误。密码错误或账号被锁定时程序会停止，不会持续尝试。
+
+只有在确认校园网门户证书确实异常时才临时使用 `--insecure`；该选项会关闭 TLS 证书验证。
+
+## 从源码构建
 
 需要 Go 1.27.1 或更新版本：
 
 ```sh
 go test ./...
 go build ./cmd/shtu-net-login
-./scripts/build-all.sh v0.1.0
+./scripts/build-all.sh v0.1.2
 ```
 
 Windows PowerShell：
 
 ```powershell
 go test ./...
-.\scripts\build-all.ps1 -Version v0.1.0
+.\scripts\build-all.ps1 -Version v0.1.2
 ```
-
-构建脚本会在 `dist/` 生成 Windows/Linux/macOS 的 amd64、arm64 文件，以及 Linux armv7 文件。
-
-## GitHub Actions 自动发布
-
-仓库内的 `.github/workflows/release.yml` 会完成测试、七目标交叉编译、SHA-256 校验及 Release 上传。发布版本时推送一个符合语义化版本格式的标签：
-
-```sh
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-工作流结束后，七个可执行文件及各自的 `.sha256` 校验文件会出现在该标签对应的 GitHub Release 中。也可以从 Actions 页面手动运行工作流，但输入的标签必须已经存在于远端仓库。
-
-工作流只在最终发布任务中授予 `contents: write`，测试和构建任务保持只读权限；发布使用 GitHub runner 自带的 `gh` 和仓库范围的 `GITHUB_TOKEN`，不需要额外配置个人令牌。
-
-## 实现依据
-
-认证请求字段和响应判断同时参考了用户提供的 HAR 与 [`ShanghaitechGeekPie/net-loginer`](https://github.com/ShanghaitechGeekPie/net-loginer)。本实现没有复制 HAR 中的账号、密码、Cookie、令牌或会话标识。
 
 第三方许可见 `THIRD_PARTY_NOTICES.md`。
