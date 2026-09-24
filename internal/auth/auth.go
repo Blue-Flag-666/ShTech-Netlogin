@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -77,6 +78,15 @@ func New(cfg config.Config, ocr OCR) (*Authenticator, error) {
 }
 
 func (a *Authenticator) Check(ctx context.Context) (State, PortalParams, error) {
+	var selectedAddresses []string
+	explicitSelection := a.cfg.IPAddress != "" || a.cfg.Interface != ""
+	if explicitSelection {
+		var err error
+		selectedAddresses, _, err = a.campusIPv4Addresses()
+		if err != nil {
+			return Offline, PortalParams{}, err
+		}
+	}
 	var errs []error
 	for _, probe := range a.cfg.Probes {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, probe.URL, nil)
@@ -97,6 +107,9 @@ func (a *Authenticator) Check(ctx context.Context) (State, PortalParams, error) 
 		}
 
 		if params, ok := parsePortalURL(resp.Request.URL); ok {
+			if explicitSelection {
+				params.IPAddress = selectRedirectAddress(params.IPAddress, selectedAddresses)
+			}
 			return Captive, params, nil
 		}
 		if resp.StatusCode == probe.Status && (probe.Contains == "" || strings.Contains(string(body), probe.Contains)) {
@@ -123,7 +136,7 @@ func parsePortalURL(u *url.URL) (PortalParams, bool) {
 }
 
 func (a *Authenticator) discoverDirect(ctx context.Context) (PortalParams, error) {
-	addresses, err := campusIPv4Addresses()
+	addresses, _, err := a.campusIPv4Addresses()
 	if err != nil {
 		return PortalParams{}, err
 	}
@@ -151,22 +164,73 @@ func (a *Authenticator) discoverDirect(ctx context.Context) (PortalParams, error
 	return PortalParams{}, fmt.Errorf("无法从门户发现认证参数: %w", errors.Join(errs...))
 }
 
-func campusIPv4Addresses() ([]string, error) {
-	addrs, err := net.InterfaceAddrs()
+func (a *Authenticator) campusIPv4Addresses() ([]string, bool, error) {
+	if a.cfg.IPAddress != "" {
+		ip := net.ParseIP(a.cfg.IPAddress)
+		if !isCampusIPv4(ip) {
+			return nil, true, fmt.Errorf("--ip 必须是 10.0.0.0/8 内的 IPv4 地址: %q", a.cfg.IPAddress)
+		}
+		return []string{ip.String()}, true, nil
+	}
+
+	var addrs []net.Addr
+	var err error
+	if a.cfg.Interface != "" {
+		iface, lookupErr := net.InterfaceByName(a.cfg.Interface)
+		if lookupErr != nil {
+			return nil, true, fmt.Errorf("查找网络接口 %q: %w", a.cfg.Interface, lookupErr)
+		}
+		if iface.Flags&net.FlagUp == 0 {
+			return nil, true, fmt.Errorf("网络接口 %q 未启用", a.cfg.Interface)
+		}
+		addrs, err = iface.Addrs()
+	} else {
+		addrs, err = net.InterfaceAddrs()
+	}
 	if err != nil {
-		return nil, err
+		return nil, a.cfg.Interface != "", err
 	}
 	var result []string
 	for _, addr := range addrs {
 		ip, _, err := net.ParseCIDR(addr.String())
-		if err == nil && ip.To4() != nil && ip.To4()[0] == 10 {
+		if err == nil && isCampusIPv4(ip) {
 			result = append(result, ip.String())
 		}
 	}
-	return result, nil
+	sort.Strings(result)
+	if a.cfg.Interface != "" && len(result) == 0 {
+		return nil, true, fmt.Errorf("网络接口 %q 没有 10.0.0.0/8 IPv4 地址", a.cfg.Interface)
+	}
+	return result, a.cfg.Interface != "", nil
+}
+
+func isCampusIPv4(ip net.IP) bool {
+	ipv4 := ip.To4()
+	return ipv4 != nil && ipv4[0] == 10
+}
+
+func selectRedirectAddress(redirected string, selected []string) string {
+	for _, address := range selected {
+		if address == redirected {
+			return address
+		}
+	}
+	return selected[0]
 }
 
 func (a *Authenticator) Login(ctx context.Context, params PortalParams) error {
+	if a.cfg.FastLogin {
+		result, err := a.submitFast(ctx, params)
+		if err == nil {
+			if result.Success {
+				return nil
+			}
+			if err := permanentLoginError(result); err != nil {
+				return err
+			}
+		}
+	}
+
 	if a.ocr == nil {
 		return errors.New("验证码识别器未初始化")
 	}
@@ -193,14 +257,10 @@ func (a *Authenticator) Login(ctx context.Context, params PortalParams) error {
 		switch result.ErrorCode {
 		case "3010":
 			continue
-		case "10505":
-			return &PermanentError{fmt.Errorf("账号已锁定，剩余 %s 分钟", stringField(result.Data, "remainLockTime"))}
-		case "10503":
-			if result.Data == nil {
-				return &PermanentError{errors.New("账号不存在")}
-			}
-			return &PermanentError{fmt.Errorf("密码错误；再错 %s 次将锁定 %s 分钟", stringField(result.Data, "remainTimes"), stringField(result.Data, "lockTime"))}
 		default:
+			if err := permanentLoginError(result); err != nil {
+				return err
+			}
 			message := result.Message
 			if message == "" {
 				message = "门户返回未知错误"
@@ -209,6 +269,20 @@ func (a *Authenticator) Login(ctx context.Context, params PortalParams) error {
 		}
 	}
 	return fmt.Errorf("验证码连续 %d 次识别失败", a.cfg.MaxCaptchaAttempts)
+}
+
+func permanentLoginError(result authResult) error {
+	switch result.ErrorCode {
+	case "10505":
+		return &PermanentError{fmt.Errorf("账号已锁定，剩余 %s 分钟", stringField(result.Data, "remainLockTime"))}
+	case "10503":
+		if result.Data == nil {
+			return &PermanentError{errors.New("账号不存在")}
+		}
+		return &PermanentError{fmt.Errorf("密码错误；再错 %s 次将锁定 %s 分钟", stringField(result.Data, "remainTimes"), stringField(result.Data, "lockTime"))}
+	default:
+		return nil
+	}
 }
 
 func (a *Authenticator) fetchCaptcha(ctx context.Context, params PortalParams) ([]byte, error) {
@@ -241,6 +315,17 @@ type authResult struct {
 	Data      map[string]any `json:"data"`
 }
 
+func (a *Authenticator) submitFast(ctx context.Context, p PortalParams) (authResult, error) {
+	form := url.Values{
+		"userName": {a.cfg.Username},
+		"userPass": {a.cfg.Password},
+		"authType": {"1"},
+		"uaddress": {p.IPAddress},
+		"agreed":   {"1"},
+	}
+	return a.submitForm(ctx, form)
+}
+
 func (a *Authenticator) submit(ctx context.Context, p PortalParams, code string) (authResult, error) {
 	form := url.Values{
 		"pushPageId": {p.PushPageID}, "userPass": {a.cfg.Password}, "authType": {"1"},
@@ -250,6 +335,10 @@ func (a *Authenticator) submit(ctx context.Context, p PortalParams, code string)
 		"businessType": {""}, "registerCode": {""}, "questions": {""},
 		"dynamicValidCode": {""}, "dynamicRSAToken": {""},
 	}
+	return a.submitForm(ctx, form)
+}
+
+func (a *Authenticator) submitForm(ctx context.Context, form url.Values) (authResult, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.cfg.BaseURL+"/portalauth/login", strings.NewReader(form.Encode()))
 	if err != nil {
 		return authResult{}, err

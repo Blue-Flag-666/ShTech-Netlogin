@@ -85,14 +85,13 @@ func (r *Recognizer) decodeCTC(values []int64) (string, error) {
 	result := ""
 	var last int64
 	for _, value := range values {
-		if value == 0 || value == last {
-			continue
-		}
-		if value < 0 || int(value) >= len(r.charset) {
-			return "", fmt.Errorf("验证码模型返回越界字符索引 %d", value)
+		if value != 0 && value != last {
+			if value < 0 || int(value) >= len(r.charset) {
+				return "", fmt.Errorf("验证码模型返回越界字符索引 %d", value)
+			}
+			result += r.charset[value]
 		}
 		last = value
-		result += r.charset[value]
 	}
 	return result, nil
 }

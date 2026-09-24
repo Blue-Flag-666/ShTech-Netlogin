@@ -128,6 +128,8 @@ chmod 600 "$config_dir/config.json"
 - Linux：`$XDG_CONFIG_HOME/shtu-net-login/config.json`，未设置时为 `~/.config/shtu-net-login/config.json`
 - macOS：`~/Library/Application Support/shtu-net-login/config.json`
 
+首次运行 `login`、`watch` 或 `status` 时，如果配置文件不存在，程序会自动创建目录和空白配置文件，并输出文件位置。配置文件在支持权限位的系统上以仅当前用户可读写（`0600`）创建；请填写学号和密码后再运行登录命令。
+
 配置示例：
 
 ```json
@@ -137,9 +139,16 @@ chmod 600 "$config_dir/config.json"
   "interval": "30s",
   "timeout": "12s",
   "max_captcha_attempts": 5,
+  "fast_login": true,
+  "ip": "",
+  "interface": "",
   "insecure": false
 }
 ```
+
+多块网卡、VPN 或容器网络同时存在多个 `10.x` 地址时，可通过 `ip` 固定客户端地址，或通过 `interface` 限定网络接口。`ip` 的优先级高于 `interface`。
+
+默认启用 `fast_login`：每次需要认证时先尝试一次不带验证码的最小登录请求，成功时跳过 OCR；如果门户不接受则自动回退到完整验证码流程。密码错误或账号锁定不会回退重试，以免增加锁号风险。可将其设为 `false` 或使用 `--no-fast-login` 禁用。
 
 也可以使用环境变量。环境变量优先于配置文件：
 
@@ -149,6 +158,9 @@ SHTU_PASSWORD     密码
 SHTU_BASE_URL     门户地址，一般无需设置
 SHTU_INTERVAL     检查间隔，例如 30s
 SHTU_TIMEOUT      请求超时，例如 12s
+SHTU_FAST_LOGIN   是否先尝试无验证码登录，true 或 false
+SHTU_IP           指定校园网 10.x IPv4 地址
+SHTU_INTERFACE    指定校园网网络接口名称
 SHTU_INSECURE     是否跳过 TLS 校验，true 或 false
 ```
 
@@ -171,6 +183,9 @@ shtu-net-login version        输出版本
 --interval 30s      watch 检查间隔
 --timeout 12s       HTTP 请求超时
 --base-url URL      覆盖门户地址
+--ip ADDRESS        指定校园网 10.x IPv4 地址
+--interface NAME    指定校园网网络接口
+--no-fast-login     禁用无验证码快速登录
 --insecure          跳过 TLS 证书校验，仅在证书异常时临时使用
 ```
 
@@ -179,7 +194,11 @@ shtu-net-login version        输出版本
 ```sh
 shtu-net-login watch --interval 1m --timeout 15s
 shtu-net-login login --config /path/to/config.json
+shtu-net-login login --interface ens192
+shtu-net-login login --ip 10.19.123.45
 ```
+
+地址选择优先级为：`--ip` / `SHTU_IP` / 配置文件 `ip`，然后是对应的 `interface` 设置，再是门户重定向返回的地址，最后才自动扫描本机 `10.0.0.0/8` 地址。命令行选项会覆盖环境变量和配置文件。
 
 ## 开机自动运行
 

@@ -51,11 +51,22 @@ func run() error {
 	interval := flags.Duration("interval", 0, "watch 检查间隔，例如 30s")
 	timeout := flags.Duration("timeout", 0, "单次网络请求超时")
 	insecure := flags.Bool("insecure", false, "跳过门户 TLS 证书校验（不推荐）")
+	noFastLogin := flags.Bool("no-fast-login", false, "禁用无验证码快速登录")
+	ipAddress := flags.String("ip", "", "指定校园网 IPv4 地址")
+	interfaceName := flags.String("interface", "", "指定校园网网络接口")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 {
 		return fmt.Errorf("无法识别的参数: %v", flags.Args())
+	}
+
+	created, err := config.Ensure(*configPath)
+	if err != nil {
+		return err
+	}
+	if created {
+		log.Printf("已创建配置文件 %s；登录前请填写学号和密码", *configPath)
 	}
 
 	cfg, err := config.Load(*configPath)
@@ -73,6 +84,18 @@ func run() error {
 	}
 	if *insecure {
 		cfg.Insecure = true
+	}
+	if *noFastLogin {
+		cfg.FastLogin = false
+	}
+	if *ipAddress != "" {
+		cfg.IPAddress = *ipAddress
+	}
+	if *interfaceName != "" {
+		if *ipAddress == "" {
+			cfg.IPAddress = ""
+		}
+		cfg.Interface = *interfaceName
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
